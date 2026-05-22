@@ -1,0 +1,182 @@
+name: Qwen Task
+
+# Manually triggered: run Qwen Code on a natural-language task, then open a PR
+# with whatever it changed. Mirrors cmd/qwen-task, but the repo is already
+# checked out so there is no clone step.
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task for Qwen Code (natural language)"
+        required: true
+        type: string
+      base:
+        description: "Base branch to start from and target with the PR"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: write       # push the task branch
+  pull-requests: write  # open the PR
+
+jobs:
+  qwen-task:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.base }}
+          fetch-depth: 0
+          # PAT with the `workflow` scope. checkout persists it as the git
+          # credential, so the later `git push` may include changes under
+          # .github/workflows/ — GITHUB_TOKEN is forbidden from pushing those.
+          token: ${{ secrets.QWEN_PAT }}
+          persist-credentials: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Qwen Code
+        run: |
+          npm install -g @qwen-code/qwen-code@latest
+          qwen --version
+
+      # Settings go to the user config dir so the repo (and the resulting PR)
+      # stays untouched. envKey pulls the model key from the secret below,
+      # so no API key is written to disk.
+      - name: Configure Qwen Code
+        run: |
+          mkdir -p "$HOME/.qwen"
+          cat > "$HOME/.qwen/settings.json" <<'EOF'
+          {
+            "modelProviders": {
+              "openai": [
+                {
+                  "id": "gpt://b1g0fdc0s8egb0178g1n/qwen3-235b-a22b-fp8/latest",
+                  "name": "Qwen3 235B (Yandex AI Studio)",
+                  "envKey": "YANDEX_API_KEY",
+                  "baseUrl": "https://llm.api.cloud.yandex.net/v1",
+                  "generationConfig": {
+                    "timeout": 120000,
+                    "maxRetries": 2,
+                    "contextWindowSize": 128000,
+                    "samplingParams": {
+                      "temperature": 0.3,
+                      "max_tokens": 8192
+                    }
+                  }
+                }
+              ]
+            },
+            "$version": 4,
+            "model": {
+              "name": "gpt://b1g0fdc0s8egb0178g1n/qwen3-235b-a22b-fp8/latest"
+            },
+            "security": {
+              "auth": {
+                "selectedType": "openai"
+              }
+            }
+          }
+          EOF
+
+      - name: Create task branch
+        id: branch
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          slug=$(printf '%s' "$TASK" | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+          [ -z "$slug" ] && slug=task
+          slug=${slug:0:40}
+          branch="qwen/${slug%-}-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$branch"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+
+      # TASK is passed via env, never interpolated into the script, to avoid
+      # shell injection from the workflow_dispatch input. --debug makes qwen
+      # log its tool calls; all output is tee'd to a log file kept in
+      # RUNNER_TEMP so it is outside the repo and never staged by `git add`.
+      - name: Run Qwen Code
+        env:
+          TASK: ${{ inputs.task }}
+          YANDEX_API_KEY: ${{ secrets.YANDEX_API_KEY }}
+        run: |
+          set -o pipefail
+          qwen --yolo --debug --prompt "$TASK" 2>&1 \
+            | tee "$RUNNER_TEMP/qwen-run.log"
+
+      # Runs even when qwen fails, so an empty/whitespace-only result is
+      # visible on the run page without downloading the artifact.
+      - name: Summarize agent run
+        if: always()
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          log="$RUNNER_TEMP/qwen-run.log"
+          {
+            echo "## Qwen agent run"
+            echo "**Task:** $TASK"
+            echo
+            echo "### Files touched (with byte size)"
+            echo '```'
+            git status --porcelain | while read -r _ path; do
+              if [ -f "$path" ]; then
+                printf '%9s  %s\n' "$(wc -c < "$path")" "$path"
+              else
+                echo "  (removed)  $path"
+              fi
+            done
+            echo '```'
+            echo "### Agent log (last 120 lines)"
+            echo '```'
+            tail -n 120 "$log" 2>/dev/null || echo "(no log captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload agent log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-run-log
+          path: ${{ runner.temp }}/qwen-run.log
+          if-no-files-found: warn
+
+      - name: Commit and push
+        env:
+          TASK: ${{ inputs.task }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          git config user.name "qwen-task[bot]"
+          git config user.email "qwen-task@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "::error::Qwen produced no changes; nothing to commit."
+            exit 1
+          fi
+          git commit -m "qwen: $TASK"
+          git push -u origin "$BRANCH"
+
+      - name: Open pull request
+        env:
+          TASK: ${{ inputs.task }}
+          BASE: ${{ inputs.base }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          ACTOR: ${{ github.actor }}
+          # Same PAT: a PR that adds workflow files cannot be opened by
+          # GITHUB_TOKEN either.
+          GH_TOKEN: ${{ secrets.QWEN_PAT }}
+        run: |
+          gh pr create \
+            --base "$BASE" \
+            --head "$BRANCH" \
+            --title "qwen: $TASK" \
+            --body "Automated task run by Qwen Code.
+
+          **Task:** $TASK
+
+          Triggered by @$ACTOR via the Qwen Task workflow."
