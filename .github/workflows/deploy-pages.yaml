@@ -1,0 +1,44 @@
+name: Deploy Pages
+
+# Publishes the repo (the snake game's index.html) to GitHub Pages on every
+# push to the default branch.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Permissions required by actions/deploy-pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Let a newer deploy supersede an in-progress one instead of queueing.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      # path: "." publishes the whole repo. index.html at the root becomes the
+      # site's landing page. Move the game into a subdir and point path there
+      # if you want to keep build/config files out of the published site.
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: "."
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
